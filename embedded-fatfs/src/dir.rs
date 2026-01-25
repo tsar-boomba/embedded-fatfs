@@ -184,7 +184,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                 Err(err) => return Err(err),
                 // directory already exists - return it
                 Ok(e) => return Ok(DirEntryOrShortName::DirEntry(e)),
-            };
+            }
             // try to generate short name
             if let Ok(name) = short_name_gen.generate() {
                 return Ok(DirEntryOrShortName::ShortName(name));
@@ -249,15 +249,12 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         let mut e = self.clone();
         loop {
             let (name, rest_opt) = split;
-            match rest_opt {
-                Some(rest) => {
-                    split = split_path(rest);
-                    e = e.find_entry(name, Some(true), None).await?.to_dir();
-                }
-                None => {
-                    e = e.find_entry(name, Some(true), None).await?.to_dir();
-                    break;
-                }
+            if let Some(rest) = rest_opt {
+                split = split_path(rest);
+                e = e.find_entry(name, Some(true), None).await?.to_dir();
+            } else {
+                e = e.find_entry(name, Some(true), None).await?.to_dir();
+                break;
             }
         }
 
@@ -287,7 +284,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                     e = e.find_entry(name, Some(true), None).await?.to_dir();
                 }
                 None => {
-                    return Ok(e.find_entry(name, None, None).await?);
+                    return e.find_entry(name, None, None).await;
                 }
             }
         }
@@ -556,7 +553,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
             }
         }
 
-        e_src.rename_internal(split_src.0, &dst_dir, split_dst.0).await
+        e_src.rename_internal(split_src.0, dst_dir, split_dst.0).await
     }
 
     async fn rename_internal(
@@ -899,7 +896,7 @@ pub(crate) struct LfnBuffer {
 const MAX_LONG_NAME_LEN: usize = 255;
 
 #[cfg(feature = "lfn")]
-const MAX_LONG_DIR_ENTRIES: usize = (MAX_LONG_NAME_LEN + LFN_PART_LEN - 1) / LFN_PART_LEN;
+const MAX_LONG_DIR_ENTRIES: usize = MAX_LONG_NAME_LEN.div_ceil(LFN_PART_LEN);
 
 #[cfg(all(feature = "lfn", not(feature = "alloc")))]
 const LONG_NAME_BUFFER_LEN: usize = MAX_LONG_DIR_ENTRIES * LFN_PART_LEN;
@@ -1115,7 +1112,7 @@ struct LfnEntriesGenerator<'a> {
 #[cfg(feature = "lfn")]
 impl<'a> LfnEntriesGenerator<'a> {
     fn new(name_utf16: &'a [u16], checksum: u8) -> Self {
-        let num_entries = (name_utf16.len() + LFN_PART_LEN - 1) / LFN_PART_LEN;
+        let num_entries = name_utf16.len().div_ceil(LFN_PART_LEN);
         // create generator using reverse iterator over chunks - first chunk can be shorter
         LfnEntriesGenerator {
             checksum,

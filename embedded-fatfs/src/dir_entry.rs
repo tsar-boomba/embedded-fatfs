@@ -395,7 +395,7 @@ impl DirEntryData {
             Err(err) => {
                 return Err(err.into());
             }
-            Ok(_) => {}
+            Ok(()) => {}
         }
         let attrs = FileAttributes::from_bits_truncate(rdr.read_u8().await?);
         if attrs & FileAttributes::LFN == FileAttributes::LFN {

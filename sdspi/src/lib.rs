@@ -49,7 +49,7 @@ impl Card {
     /// Size in bytes
     pub fn size(&self) -> u64 {
         // SDHC / SDXC / SDUC
-        u64::from(self.csd.block_count()) * 512
+        self.csd.block_count() * 512
     }
 }
 

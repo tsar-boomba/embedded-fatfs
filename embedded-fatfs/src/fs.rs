@@ -996,7 +996,7 @@ impl FormatVolumeOptions {
     #[must_use]
     pub fn bytes_per_cluster(mut self, bytes_per_cluster: u32) -> Self {
         assert!(
-            bytes_per_cluster.count_ones() == 1 && bytes_per_cluster >= 512,
+            bytes_per_cluster.is_power_of_two() && bytes_per_cluster >= 512,
             "Invalid bytes_per_cluster"
         );
         self.bytes_per_cluster = Some(bytes_per_cluster);
@@ -1026,7 +1026,7 @@ impl FormatVolumeOptions {
     #[must_use]
     pub fn bytes_per_sector(mut self, bytes_per_sector: u16) -> Self {
         assert!(
-            bytes_per_sector.count_ones() == 1 && bytes_per_sector >= 512,
+            bytes_per_sector.is_power_of_two() && bytes_per_sector >= 512,
             "Invalid bytes_per_sector"
         );
         self.bytes_per_sector = Some(bytes_per_sector);
