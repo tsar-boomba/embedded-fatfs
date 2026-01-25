@@ -32,7 +32,7 @@ defmt = ["dep:defmt"]
 dirty-file-panic = []
 
 # Default features
-default = ["chrono", "std", "alloc", "lfn", "unicode", "log"]
+default = ["chrono", "lfn", "unicode", "log"]
 
 [dependencies]
 # core deps
@@ -45,7 +45,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"], opti
 tokio = { version = "1", default-features = false, optional = true }
 elain = { version = "0.3", optional = true }
 log = { version = "0.4", optional = true }
-defmt = { version = "0.3", optional = true }
+defmt = { version = "1.0", optional = true }
 
 [dev-dependencies]
 env_logger = "0.9"
