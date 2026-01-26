@@ -32,7 +32,7 @@ defmt = ["dep:defmt"]
 dirty-file-panic = []
 
 # Default features
-default = ["chrono", "lfn", "unicode", "log"]
+default = ["lfn", "unicode", "log"]
 
 [dependencies]
 # core deps
