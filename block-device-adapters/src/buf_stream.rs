@@ -128,6 +128,7 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
                 && self.current_offset % SIZE as u64 == 0
             {
                 // If the provided buffer has a suitable length and alignment _and_ the read head is on a block boundary, use it directly
+                trace!("BufStream::read zero-copy path!");
                 let block = self.pointer_block_start();
                 self.inner.read(block, slice_to_blocks_mut(buf)).await?;
 
@@ -177,6 +178,7 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Write for BufStream<T, SIZE> {
                 && self.current_offset % SIZE as u64 == 0
             {
                 // If the provided buffer has a suitable length and alignment _and_ the write head is on a block boundary, use it directly
+                trace!("BufStream::write zero-copy path!");
                 let block = self.pointer_block_start();
                 self.inner.write(block, slice_to_blocks(buf)).await?;
 
