@@ -17,7 +17,7 @@ exclude = [
 
 [features]
 # Use Rust std library
-std = ["embedded-io-async/std", "dep:tokio", "dep:embedded-io-adapters"]
+std = ["alloc", "embedded-io-async/std", "dep:tokio", "dep:embedded-io-adapters"]
 # LFN (Long File Name) support
 lfn = []
 # Use dynamic allocation. When used without std please enable core_io/collections
@@ -32,7 +32,7 @@ defmt = ["dep:defmt"]
 dirty-file-panic = []
 
 # Default features
-default = ["lfn", "unicode", "log"]
+default = ["lfn", "unicode"]
 
 [dependencies]
 # core deps

@@ -200,7 +200,7 @@ where
             self.read_data(&mut cid).await?;
             card.cid = u128::from_be_bytes(cid).into();
 
-            trace!("Card initialized: {:?}", card);
+            // trace!("Card initialized: {:?}", Debug2Format(&card));
             debug!("Found card with size: {}bytes", card.size());
 
             self.card = Some(card);

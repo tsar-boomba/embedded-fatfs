@@ -21,7 +21,6 @@ use crate::FileContext;
 bitflags! {
     /// A FAT file attributes.
     #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct FileAttributes: u8 {
         const READ_ONLY  = 0x01;
         const HIDDEN     = 0x02;
@@ -31,6 +30,13 @@ bitflags! {
         const ARCHIVE    = 0x20;
         const LFN        = Self::READ_ONLY.bits() | Self::HIDDEN.bits()
                          | Self::SYSTEM.bits() | Self::VOLUME_ID.bits();
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for FileAttributes {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "{}", self.bits())
     }
 }
 
