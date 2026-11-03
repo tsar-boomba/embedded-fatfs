@@ -390,3 +390,45 @@ async fn read_to_end<IO: embedded_io_async::Read>(io: &mut IO) -> Result<Vec<u8>
 
     Ok(buf)
 }
+
+async fn test_open_file_at(fs: FileSystem) {
+    let root_dir = fs.root_dir();
+    let entries = root_dir.iter().collect().await;
+    let entries = entries.iter().map(|r| r.as_ref().unwrap()).collect::<Vec<_>>();
+
+    for entry in &entries {
+        let reopened = fs.open_file_at(entry.entry_pos()).await;
+        if entry.is_dir() {
+            assert!(reopened.is_err(), "directory {} opened as a file", entry.file_name());
+            continue;
+        }
+
+        let (date, time) = entry.modified_raw();
+        assert_eq!(embedded_fatfs::DateTime::from_fat(date, time), entry.modified());
+
+        let mut by_pos = reopened.unwrap();
+        let mut by_path = root_dir.open_file(&entry.file_name()).await.unwrap();
+        let by_pos = read_to_end(&mut by_pos).await.unwrap();
+        assert_eq!(by_pos.len() as u64, entry.len());
+        assert_eq!(by_pos, read_to_end(&mut by_path).await.unwrap());
+    }
+
+    // An LFN record is not a file entry
+    let long_dir = entries.iter().find(|e| e.file_name() == "very-long-dir-name").unwrap();
+    assert!(fs.open_file_at(long_dir.entry_pos() - 32).await.is_err());
+}
+
+#[tokio::test]
+async fn test_open_file_at_fat12() {
+    test_open_file_at(create_fs(FAT12_IMG).await).await
+}
+
+#[tokio::test]
+async fn test_open_file_at_fat16() {
+    test_open_file_at(create_fs(FAT16_IMG).await).await
+}
+
+#[tokio::test]
+async fn test_open_file_at_fat32() {
+    test_open_file_at(create_fs(FAT32_IMG).await).await
+}

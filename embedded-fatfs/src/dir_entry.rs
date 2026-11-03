@@ -727,6 +727,22 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
         self.data.modified()
     }
 
+    /// Returns the raw FAT `(date, time)` of the last modification.
+    ///
+    /// Decode it with [`DateTime::from_fat`]. Useful for caching entries compactly.
+    #[must_use]
+    pub fn modified_raw(&self) -> (u16, u16) {
+        (self.data.modify_date, self.data.modify_time)
+    }
+
+    /// Returns the byte offset of this entry's short-name record on the volume.
+    ///
+    /// Pass it to [`FileSystem::open_file_at`] to reopen the file without searching its directory.
+    #[must_use]
+    pub fn entry_pos(&self) -> u64 {
+        self.entry_pos
+    }
+
     pub(crate) fn raw_short_name(&self) -> &[u8; SFN_SIZE] {
         &self.data.name
     }
@@ -839,5 +855,59 @@ mod tests {
         assert_eq!(raw_entry.lowercase_name().to_string(&oem_cp_conv), "FOO.rs");
         raw_entry.reserved_0 = 0;
         assert_eq!(raw_entry.lowercase_name().to_string(&oem_cp_conv), "FOO.RS");
+    }
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
+    /// Opens the file whose short-name directory record starts at `entry_pos`, as returned by
+    /// [`DirEntry::entry_pos`].
+    ///
+    /// This costs one read of the record instead of a directory search. The record is checked to
+    /// be a live, non-directory file entry, but it is the caller's job to make sure the position
+    /// still refers to the same file (it changes if the file is deleted, renamed, or replaced).
+    ///
+    /// # Errors
+    ///
+    /// * `Error::NotFound` if the record at `entry_pos` is not a live file entry.
+    /// * `Error::Io` if the underlying storage returned an I/O error.
+    pub async fn open_file_at(&self, entry_pos: u64) -> Result<File<'_, IO, TP, OCC>, Error<IO::Error>> {
+        trace!("FileSystem::open_file_at {}", entry_pos);
+        let mut raw = [0u8; DIR_ENTRY_SIZE as usize];
+        {
+            let mut disk = self.disk.borrow_mut();
+            disk.seek(io::SeekFrom::Start(entry_pos)).await?;
+            disk.read_exact(&mut raw).await?;
+        }
+
+        let attrs = FileAttributes::from_bits_truncate(raw[11]);
+        let le16 = |i: usize| u16::from_le_bytes([raw[i], raw[i + 1]]);
+        let mut name = [0u8; SFN_SIZE];
+        name.copy_from_slice(&raw[..SFN_SIZE]);
+        let data = DirFileEntryData {
+            name,
+            attrs,
+            reserved_0: raw[12],
+            create_time_0: raw[13],
+            create_time_1: le16(14),
+            create_date: le16(16),
+            access_date: le16(18),
+            first_cluster_hi: le16(20),
+            modify_time: le16(22),
+            modify_date: le16(24),
+            first_cluster_lo: le16(26),
+            size: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
+        };
+
+        if data.is_end()
+            || data.is_deleted()
+            || attrs & FileAttributes::LFN == FileAttributes::LFN
+            || data.is_dir()
+            || data.is_volume()
+        {
+            return Err(Error::NotFound);
+        }
+
+        let first_cluster = data.first_cluster(self.fat_type());
+        Ok(File::new(first_cluster, Some(DirEntryEditor::new(data, entry_pos)), self))
     }
 }

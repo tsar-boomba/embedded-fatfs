@@ -130,6 +130,14 @@ impl DateTime {
     pub(crate) fn decode(dos_date: u16, dos_time: u16, dos_time_hi_res: u8) -> Self {
         Self::new(Date::decode(dos_date), Time::decode(dos_time, dos_time_hi_res))
     }
+
+    /// Decodes a raw FAT date and time, such as from [`DirEntry::modified_raw`](crate::DirEntry::modified_raw).
+    ///
+    /// Equivalent to [`DirEntry::modified`](crate::DirEntry::modified) for the same values.
+    #[must_use]
+    pub fn from_fat(dos_date: u16, dos_time: u16) -> Self {
+        Self::decode(dos_date, dos_time, 0)
+    }
 }
 
 #[cfg(feature = "chrono")]
