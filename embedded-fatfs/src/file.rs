@@ -1,5 +1,6 @@
 use core::cmp;
 
+use crate::cluster_map::ClusterMap;
 use crate::dir_entry::DirEntryEditor;
 use crate::error::Error;
 use crate::fs::{FileSystem, ReadWriteSeek};
@@ -7,6 +8,10 @@ use crate::io::{IoBase, Read, Seek, SeekFrom, Write};
 use crate::time::{Date, DateTime, TimeProvider};
 
 const MAX_FILE_SIZE: u32 = core::u32::MAX;
+
+/// How many clusters past what a read needs to map while they stay consecutive on disk. 128 is a
+/// FAT32 sector's worth of entries.
+const MAP_AHEAD: u32 = 128;
 
 /// A FAT filesystem file object used for reading and writing data.
 ///
@@ -34,6 +39,16 @@ pub struct FileContext {
     pub(crate) offset: u32,
     // file dir entry editor - None for root dir
     pub(crate) entry: Option<DirEntryEditor>,
+    // where the part of the cluster chain followed so far is on disk
+    pub(crate) clusters: ClusterMap,
+}
+
+/// Result of looking up a file cluster.
+enum ClusterLookup {
+    /// The disk cluster holding it
+    Found(u32),
+    /// The cluster chain is shorter: its length and last cluster
+    ChainEnd { len: u32, last: Option<u32> },
 }
 
 /// An extent containing a file's data on disk.
@@ -60,6 +75,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
                 entry,
                 current_cluster: None, // cluster before first one
                 offset: 0,
+                clusters: ClusterMap::default(),
             },
             fs,
         }
@@ -101,9 +117,12 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
         if let Some(current_cluster) = self.context.current_cluster {
             // current cluster is none only if offset is 0
             debug_assert!(self.context.offset > 0);
+            let clusters_kept = (self.context.offset - 1) / self.fs.cluster_size() + 1;
+            self.context.clusters.truncate(clusters_kept);
             self.fs.truncate_cluster_chain(current_cluster).await
         } else {
             debug_assert!(self.context.offset == 0);
+            self.context.clusters.truncate(0);
             if let Some(n) = self.context.first_cluster {
                 self.fs.free_cluster_chain(n).await?;
                 self.context.first_cluster = None;
@@ -147,6 +166,99 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     // .flatten()
     // todo!("extents needs to be implemented using AsyncIterator");
     // }
+
+    /// The file cluster index and disk cluster of the current position, if it has one. Between
+    /// clusters, this is the previous cluster.
+    fn current_position(&self) -> Option<(u32, u32)> {
+        let cluster = self.context.current_cluster?;
+        let offset = self.context.offset.checked_sub(1)?;
+        Some((offset / self.fs.cluster_size(), cluster))
+    }
+
+    /// Finds the disk cluster holding file cluster `index`.
+    ///
+    /// Uses the cluster map if it covers `index`. Otherwise follows the chain from the closest
+    /// known cluster before `index` (from the map, or the current position), mapping the clusters
+    /// on the way.
+    async fn cluster_at(&mut self, index: u32) -> Result<ClusterLookup, Error<IO::Error>> {
+        if let Some((cluster, _)) = self.context.clusters.get(index) {
+            return Ok(ClusterLookup::Found(cluster));
+        }
+        let Some(first_cluster) = self.context.first_cluster else {
+            return Ok(ClusterLookup::ChainEnd { len: 0, last: None });
+        };
+
+        let mut start = self.context.clusters.nearest(index).unwrap_or((0, first_cluster));
+        if let Some(current) = self.current_position() {
+            if current.0 <= index && current.0 > start.0 {
+                start = current;
+            }
+        }
+        self.context.clusters.record(start.0, start.1);
+
+        let (mut i, mut cluster) = start;
+        let fs = self.fs;
+        let mut iter = fs.cluster_iter(cluster);
+        while i < index {
+            match iter.next().await {
+                Some(Ok(next)) => {
+                    i += 1;
+                    cluster = next;
+                    self.context.clusters.record(i, cluster);
+                }
+                Some(Err(err)) => return Err(err),
+                None => {
+                    return Ok(ClusterLookup::ChainEnd {
+                        len: i + 1,
+                        last: Some(cluster),
+                    })
+                }
+            }
+        }
+        Ok(ClusterLookup::Found(cluster))
+    }
+
+    /// Finds the disk cluster holding file cluster `index`, and how many clusters from there on
+    /// (at least 1) are known to be consecutive on disk. Returns `None` if the chain doesn't reach
+    /// `index`.
+    ///
+    /// If `follow` is set, `want` clusters are needed, and the map ends inside the run containing
+    /// `index`, the chain is followed further: until `want` clusters are found, then on up to
+    /// [`MAP_AHEAD`] more clusters while they stay consecutive. Those FAT entries are almost
+    /// always in the FAT sector just read, and mapping them now saves going back to the FAT at the
+    /// next cluster boundaries.
+    async fn consecutive_clusters(
+        &mut self,
+        index: u32,
+        want: u32,
+        follow: bool,
+    ) -> Result<Option<(u32, u32)>, Error<IO::Error>> {
+        let cluster = match self.cluster_at(index).await? {
+            ClusterLookup::Found(cluster) => cluster,
+            ClusterLookup::ChainEnd { .. } => return Ok(None),
+        };
+        let mut count = self.context.clusters.get(index).map_or(1, |(_, n)| n);
+        // Only go to the FAT when this read needs more than is mapped
+        if follow && count < want && index + count >= self.context.clusters.known() {
+            let limit = want.saturating_add(MAP_AHEAD);
+            let fs = self.fs;
+            let mut iter = fs.cluster_iter(cluster + count - 1);
+            while count < limit {
+                match iter.next().await {
+                    Some(Ok(next)) => {
+                        self.context.clusters.record(index + count, next);
+                        if next != cluster + count {
+                            break;
+                        }
+                        count += 1;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => break,
+                }
+            }
+        }
+        Ok(Some((cluster, count)))
+    }
 
     pub(crate) fn abs_pos(&self) -> Option<u64> {
         // Returns current position relative to filesystem start
@@ -269,6 +381,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
             current_cluster: self.context.current_cluster,
             offset: self.context.offset,
             entry: self.context.entry.clone(),
+            clusters: self.context.clusters.clone(),
         })
     }
 }
@@ -302,38 +415,33 @@ impl<IO: ReadWriteSeek, TP, OCC> IoBase for File<'_, IO, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
+    /// Reads from the current position, up to the end of the run of consecutive clusters it is
+    /// in, so one read of the underlying device can span many clusters.
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         trace!("File::read");
         let cluster_size = self.fs.cluster_size();
-        let current_cluster_opt = if self.context.offset % cluster_size == 0 {
-            // next cluster
-            match self.context.current_cluster {
-                None => self.context.first_cluster,
-                Some(n) => {
-                    let r = self.fs.cluster_iter(n).next().await;
-                    match r {
-                        Some(Err(err)) => return Err(err),
-                        Some(Ok(n)) => Some(n),
-                        None => None,
-                    }
-                }
-            }
-        } else {
-            self.context.current_cluster
-        };
-        let current_cluster = match current_cluster_opt {
-            Some(n) => n,
-            None => return Ok(0),
-        };
         let offset_in_cluster = self.context.offset % cluster_size;
-        let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
-        let bytes_left_in_file = self.bytes_left_in_file().unwrap_or(bytes_left_in_cluster);
-        let read_size = cmp::min(cmp::min(buf.len(), bytes_left_in_cluster), bytes_left_in_file);
-        if read_size == 0 {
+        let max_read = match self.bytes_left_in_file() {
+            Some(left) => cmp::min(buf.len(), left),
+            None => buf.len(),
+        };
+        if max_read == 0 {
             return Ok(0);
         }
-        trace!("read {} bytes in cluster {}", read_size, current_cluster);
-        let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+        let index = self.context.offset / cluster_size;
+        let want = (u64::from(offset_in_cluster) + max_read as u64).div_ceil(u64::from(cluster_size));
+        let want = u32::try_from(want).unwrap_or(u32::MAX);
+        // Only go to the FAT for more clusters at a cluster boundary. Mid-cluster, the block cache
+        // of the underlying storage usually holds the start of this read, and reading the FAT
+        // would evict it; the next read starts at the boundary anyway.
+        let at_boundary = offset_in_cluster == 0;
+        let Some((cluster, count)) = self.consecutive_clusters(index, want, at_boundary).await? else {
+            return Ok(0);
+        };
+        let bytes_in_run = u64::from(count) * u64::from(cluster_size) - u64::from(offset_in_cluster);
+        let read_size = cmp::min(max_read as u64, bytes_in_run) as usize;
+        trace!("read {} bytes from cluster {}", read_size, cluster);
+        let offset_in_fs = self.fs.offset_from_cluster(cluster) + u64::from(offset_in_cluster);
         let read_bytes = {
             let mut disk = self.fs.disk.borrow_mut();
             disk.seek(SeekFrom::Start(offset_in_fs)).await?;
@@ -343,7 +451,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
             return Ok(0);
         }
         self.context.offset += read_bytes as u32;
-        self.context.current_cluster = Some(current_cluster);
+        // The cluster holding the last byte read
+        self.context.current_cluster = Some(cluster + ((self.context.offset - 1) / cluster_size - index));
 
         if let Some(ref mut e) = self.context.entry {
             if self.fs.options.update_accessed_date {
@@ -468,24 +577,18 @@ impl<IO: ReadWriteSeek, TP, OCC> Seek for File<'_, IO, TP, OCC> {
             None
         } else if new_offset_in_clusters == old_offset_in_clusters {
             self.context.current_cluster
-        } else if let Some(first_cluster) = self.context.first_cluster {
-            // calculate number of clusters to skip
+        } else if self.context.first_cluster.is_some() {
             // return the previous cluster if the offset points to the cluster boundary
             // Note: new_offset_in_clusters cannot be 0 here because new_offset is not 0
             debug_assert!(new_offset_in_clusters > 0);
-            let clusters_to_skip = new_offset_in_clusters - 1;
-            let mut cluster = first_cluster;
-            let mut iter = self.fs.cluster_iter(first_cluster);
-            for i in 0..clusters_to_skip {
-                cluster = if let Some(r) = iter.next().await {
-                    r?
-                } else {
+            match self.cluster_at(new_offset_in_clusters - 1).await? {
+                ClusterLookup::Found(cluster) => Some(cluster),
+                ClusterLookup::ChainEnd { len, last } => {
                     // cluster chain ends before the new position - seek to the end of the last cluster
-                    new_offset = self.fs.bytes_from_clusters(i + 1) as u32;
-                    break;
-                };
+                    new_offset = self.fs.bytes_from_clusters(len) as u32;
+                    last
+                }
             }
-            Some(cluster)
         } else {
             // empty file - always seek to 0
             new_offset = 0;

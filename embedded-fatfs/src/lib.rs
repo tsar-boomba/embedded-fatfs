@@ -66,6 +66,7 @@ extern crate alloc;
 mod fmt;
 
 mod boot_sector;
+mod cluster_map;
 mod dir;
 mod dir_entry;
 mod error;
