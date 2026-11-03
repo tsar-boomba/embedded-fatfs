@@ -30,6 +30,11 @@ pub const DATA_RES_MASK: u8 = 0x1F;
 /// Write data accepted token
 pub const DATA_RES_ACCEPTED: u8 = 0x05;
 
+/// How many bytes to clock per SPI transfer while waiting for a data start token. Polling one
+/// byte per transfer spends far more time on transfer setup than on the bus. Bytes that arrive
+/// after the token aren't lost: they're the start of the data block.
+const TOKEN_POLL_LEN: usize = 32;
+
 #[derive(Clone, Copy, Debug, Default)]
 /// SD Card
 pub struct Card {
@@ -288,30 +293,52 @@ where
     }
 
     async fn read_data(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
-        let r = with_timeout(self.delay.clone(), 1000, async {
-            let mut byte = 0xFF;
-            while byte == 0xFF {
-                byte = self.read_byte().await?;
+        // Never clock past this block's CRC. In a multi-block read the next block's token can
+        // follow it immediately, and anything read here would be lost.
+        let poll_len = TOKEN_POLL_LEN.min(1 + buffer.len() + 2);
+        let mut poll = [0xFFu8; TOKEN_POLL_LEN];
+
+        let data_start = with_timeout(self.delay.clone(), 1000, async {
+            loop {
+                let chunk = &mut poll[..poll_len];
+                chunk.fill(0xFF);
+                self.spi
+                    .transfer_in_place(chunk)
+                    .await
+                    .map_err(|_| Error::SpiError)?;
+
+                if let Some(i) = chunk.iter().position(|&b| b != 0xFF) {
+                    if chunk[i] != DATA_START_BLOCK {
+                        return Err(Error::RegisterError(chunk[i]));
+                    }
+                    return Ok(i + 1);
+                }
             }
-            Ok(byte)
         })
         .await??;
 
-        if r != DATA_START_BLOCK {
-            return Err(Error::RegisterError(r));
-        }
-
-        buffer.fill(0xFF);
-        self.spi
-            .transfer_in_place(buffer)
-            .await
-            .map_err(|_| Error::SpiError)?;
-
+        // Bytes clocked in after the token are the start of the data, then the CRC
+        let early = &poll[data_start..poll_len];
+        let n_data = early.len().min(buffer.len());
+        let n_crc = early.len() - n_data;
+        buffer[..n_data].copy_from_slice(&early[..n_data]);
         let mut crc_bytes = [0xFF; 2];
-        self.spi
-            .transfer_in_place(&mut crc_bytes)
-            .await
-            .map_err(|_| Error::SpiError)?;
+        crc_bytes[..n_crc].copy_from_slice(&early[n_data..]);
+
+        let rest = &mut buffer[n_data..];
+        if !rest.is_empty() {
+            rest.fill(0xFF);
+            self.spi
+                .transfer_in_place(rest)
+                .await
+                .map_err(|_| Error::SpiError)?;
+        }
+        if n_crc < crc_bytes.len() {
+            self.spi
+                .transfer_in_place(&mut crc_bytes[n_crc..])
+                .await
+                .map_err(|_| Error::SpiError)?;
+        }
         let crc = u16::from_be_bytes(crc_bytes);
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
@@ -465,15 +492,203 @@ fn crc7(data: &[u8]) -> u8 {
     (crc << 1) | 1
 }
 
-/// Perform the X25 CRC calculation, as used for data blocks.
+/// Lookup table for [`crc16`]: the CRC of each possible high byte.
+///
+/// A `static` so it exists once and can be placed in RAM with the `crc-table-in-ram` feature.
+/// `.data.*` input sections are copied from flash to RAM at boot by cortex-m-rt style linker
+/// scripts, so lookups never go through the flash cache.
+#[cfg_attr(
+    feature = "crc-table-in-ram",
+    unsafe(link_section = ".data.sdspi_crc16_table")
+)]
+static CRC16_TABLE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// The CRC-16-CCITT (XModem: polynomial 0x1021, initial value 0) used for data blocks.
+///
+/// Table-driven, one lookup per byte. This runs on every block read and written, so it matters.
 fn crc16(data: &[u8]) -> u16 {
     let mut crc = 0u16;
     for &byte in data {
-        crc = ((crc >> 8) & 0xFF) | (crc << 8);
-        crc ^= u16::from(byte);
-        crc ^= (crc & 0xFF) >> 4;
-        crc ^= crc << 12;
-        crc ^= (crc & 0xFF) << 5;
+        crc = (crc << 8) ^ CRC16_TABLE[usize::from((crc >> 8) as u8 ^ byte)];
     }
     crc
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use core::convert::Infallible;
+    use embedded_hal_async::spi::{ErrorType, Operation, SpiDevice};
+    use std::{collections::VecDeque, vec, vec::Vec};
+
+    /// The previous bitwise implementation, kept as a reference.
+    fn crc16_bitwise(data: &[u8]) -> u16 {
+        let mut crc = 0u16;
+        for &byte in data {
+            crc = ((crc >> 8) & 0xFF) | (crc << 8);
+            crc ^= u16::from(byte);
+            crc ^= (crc & 0xFF) >> 4;
+            crc ^= crc << 12;
+            crc ^= (crc & 0xFF) << 5;
+        }
+        crc
+    }
+
+    #[test]
+    fn crc16_matches_bitwise_and_known_value() {
+        // From the SD spec: a block of 512 0xFF bytes has CRC 0x7FA1
+        assert_eq!(crc16(&[0xFF; 512]), 0x7FA1);
+        let data: Vec<u8> = (0..4096u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for len in [0, 1, 2, 16, 511, 512, 4096] {
+            assert_eq!(crc16(&data[..len]), crc16_bitwise(&data[..len]));
+        }
+    }
+
+    /// Plays back a fixed byte stream for every byte clocked in, 0xFF once it runs out.
+    struct MockSpi {
+        stream: VecDeque<u8>,
+        transfers: usize,
+    }
+
+    impl ErrorType for MockSpi {
+        type Error = Infallible;
+    }
+
+    impl SpiDevice for MockSpi {
+        async fn transaction(
+            &mut self,
+            operations: &mut [Operation<'_, u8>],
+        ) -> Result<(), Infallible> {
+            self.transfers += 1;
+            for op in operations {
+                let len = match op {
+                    Operation::Read(buf) | Operation::TransferInPlace(buf) => {
+                        for b in buf.iter_mut() {
+                            *b = self.stream.pop_front().unwrap_or(0xFF);
+                        }
+                        continue;
+                    }
+                    Operation::Write(buf) => buf.len(),
+                    Operation::Transfer(read, write) => read.len().max(write.len()),
+                    Operation::DelayNs(_) => 0,
+                };
+                for _ in 0..len {
+                    self.stream.pop_front();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A delay that never finishes, so timeouts never fire
+    #[derive(Clone)]
+    struct NoDelay;
+
+    impl embedded_hal_async::delay::DelayNs for NoDelay {
+        async fn delay_ns(&mut self, _ns: u32) {
+            core::future::pending().await
+        }
+    }
+
+    fn block(gap: usize, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xFF; gap];
+        out.push(DATA_START_BLOCK);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&crc16(data).to_be_bytes());
+        out
+    }
+
+    fn sd(stream: Vec<u8>) -> SdSpi<MockSpi, NoDelay, aligned::A1> {
+        SdSpi::new(
+            MockSpi {
+                stream: stream.into(),
+                transfers: 0,
+            },
+            NoDelay,
+        )
+    }
+
+    #[test]
+    fn read_data_after_long_wait() {
+        let data: Vec<u8> = (0..512u32).map(|i| (i * 13) as u8).collect();
+        let mut sd = sd(block(100, &data));
+        let mut buf = [0u8; 512];
+        embassy_futures::block_on(sd.read_data(&mut buf)).unwrap();
+        assert_eq!(buf[..], data[..]);
+        // 101 bytes up to and including the token at 32 per poll is 4 polls, the last of
+        // which holds the first 27 data bytes. Then the rest of the data, then the CRC.
+        assert_eq!(sd.spi.transfers, 4 + 1 + 1);
+    }
+
+    #[test]
+    fn read_data_back_to_back_blocks() {
+        // Multi-block read: the next token follows the CRC with no gap at all. Each block must
+        // stop exactly at its own CRC.
+        let a: Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+        let b: Vec<u8> = (0..512u32).map(|i| (i * 3 + 1) as u8).collect();
+        let mut stream = block(0, &a);
+        stream.extend(block(0, &b));
+        let mut sd = sd(stream);
+
+        let mut buf = [0u8; 512];
+        embassy_futures::block_on(sd.read_data(&mut buf)).unwrap();
+        assert_eq!(buf[..], a[..]);
+        embassy_futures::block_on(sd.read_data(&mut buf)).unwrap();
+        assert_eq!(buf[..], b[..]);
+    }
+
+    #[test]
+    fn read_data_short_register_read() {
+        // CSD/CID reads are 16 bytes. Here the whole block, CRC included, arrives in the poll.
+        let csd: Vec<u8> = (0..16u8).collect();
+        let mut stream = block(0, &csd);
+        stream.extend([0x12, 0x34]);
+        let mut sd = sd(stream);
+
+        let mut buf = [0u8; 16];
+        embassy_futures::block_on(sd.read_data(&mut buf)).unwrap();
+        assert_eq!(buf[..], csd[..]);
+        assert_eq!(sd.spi.transfers, 1);
+        // Nothing past the CRC was consumed
+        assert_eq!(sd.spi.stream, [0x12, 0x34]);
+    }
+
+    #[test]
+    fn read_data_rejects_error_token_and_bad_crc() {
+        let mut sd1 = sd(vec![0xFF, 0xFF, 0x08]);
+        let mut buf = [0u8; 512];
+        assert_eq!(
+            embassy_futures::block_on(sd1.read_data(&mut buf)),
+            Err(Error::RegisterError(0x08))
+        );
+
+        let mut stream = block(3, &[0xAB; 512]);
+        let last = stream.len() - 1;
+        stream[last] ^= 1;
+        let mut sd2 = sd(stream);
+        assert!(matches!(
+            embassy_futures::block_on(sd2.read_data(&mut buf)),
+            Err(Error::CrcMismatch(..))
+        ));
+    }
 }

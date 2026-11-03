@@ -19,3 +19,6 @@ defmt = { version = "1", optional = true }
 log = ["dep:log"]
 # enable defmt support
 defmt = ["dep:defmt"]
+# Place the CRC lookup table (512 bytes) in RAM instead of flash. Needs a linker script that
+# loads `.data.*` input sections into RAM, as cortex-m-rt's does.
+crc-table-in-ram = []
