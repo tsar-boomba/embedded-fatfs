@@ -119,20 +119,42 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> embedded_io_async::ErrorType for B
 }
 
 impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
+    /// Reads are split into up to three parts so a misaligned read still moves most of its data
+    /// in one multi-block transfer:
+    ///
+    /// 1. A partial first block, copied out of the block cache.
+    /// 2. All whole blocks in the middle, read straight into `buf` in one call to the device
+    ///    (when that part of `buf` meets the device's alignment).
+    /// 3. A partial last block, loaded into the block cache and copied out. The next sequential
+    ///    read starts inside that block, so its first part is served from the cache.
     async fn read(&mut self, mut buf: &mut [u8]) -> Result<usize, Self::Error> {
         let mut total = 0;
         let target = buf.len();
-        loop {
-            let bytes_read = if buf.len() % SIZE == 0
+        while total < target {
+            let bytes_read = if buf.len() >= SIZE
                 && buf.as_ptr().cast::<u8>() as usize % Self::ALIGN == 0
                 && self.current_offset % SIZE as u64 == 0
             {
-                // If the provided buffer has a suitable length and alignment _and_ the read head is on a block boundary, use it directly
-                trace!("BufStream::read zero-copy path!");
+                // On a block boundary with at least one whole block left: read every whole block
+                // directly into the caller's buffer.
+                let len = buf.len() - buf.len() % SIZE;
                 let block = self.pointer_block_start();
-                self.inner.read(block, slice_to_blocks_mut(buf)).await?;
+                let n_blocks = (len / SIZE) as u32;
+                trace!("BufStream::read zero-copy path! {} blocks", n_blocks);
 
-                buf.len()
+                // A dirty cached block inside this range hasn't reached the device yet
+                if self.dirty
+                    && self.current_block >= block
+                    && self.current_block - block < n_blocks
+                {
+                    self.flush().await?;
+                }
+
+                let (direct, rest) = buf.split_at_mut(len);
+                self.inner.read(block, slice_to_blocks_mut(direct)).await?;
+                buf = rest;
+
+                len
             } else {
                 let block_start = self.pointer_block_start_addr();
                 let block_end = block_start + SIZE as u64;
@@ -147,24 +169,21 @@ impl<T: BlockDevice<SIZE>, const SIZE: usize> Read for BufStream<T, SIZE> {
 
                 // copy as much as possible, up to the block boundary
                 let buffer_offset = (self.current_offset - block_start) as usize;
-                let bytes_to_read = buf.len();
-
-                let end = core::cmp::min(buffer_offset + bytes_to_read, SIZE);
+                let end = core::cmp::min(buffer_offset + buf.len(), SIZE);
                 trace!("buffer_offset {}, end {}", buffer_offset, end);
                 let bytes_read = end - buffer_offset;
-                buf[..bytes_read].copy_from_slice(&self.buffer[buffer_offset..end]);
-                buf = &mut buf[bytes_read..]; // move the buffer along
+                let (copied, rest) = buf.split_at_mut(bytes_read);
+                copied.copy_from_slice(&self.buffer[buffer_offset..end]);
+                buf = rest;
 
                 bytes_read
             };
 
             self.current_offset += bytes_read as u64;
             total += bytes_read;
-
-            if total == target {
-                return Ok(total);
-            }
         }
+
+        Ok(total)
     }
 }
 
@@ -515,6 +534,125 @@ mod tests {
             &block.into_inner().0.into_inner().into_inner()[3..512],
             &aligned_buffer[3..]
         )
+    }
+
+    /// Wraps the test device and counts block reads, so tests can check how a read was split.
+    struct CountingBlockDevice<T> {
+        inner: T,
+        /// Number of blocks requested by each `read` call
+        reads: Vec<usize>,
+    }
+
+    impl<T: BlockDevice<512>> BlockDevice<512> for CountingBlockDevice<T> {
+        type Error = T::Error;
+        type Align = T::Align;
+
+        async fn read(
+            &mut self,
+            block_address: u32,
+            data: &mut [Aligned<Self::Align, [u8; 512]>],
+        ) -> Result<(), Self::Error> {
+            self.reads.push(data.len());
+            self.inner.read(block_address, data).await
+        }
+
+        async fn write(
+            &mut self,
+            block_address: u32,
+            data: &[Aligned<Self::Align, [u8; 512]>],
+        ) -> Result<(), Self::Error> {
+            self.inner.write(block_address, data).await
+        }
+
+        async fn size(&mut self) -> Result<u64, Self::Error> {
+            self.inner.size().await
+        }
+    }
+
+    fn counting_stream(
+        data: Vec<u8>,
+    ) -> BufStream<
+        CountingBlockDevice<
+            TestBlockDevice<embedded_io_adapters::tokio_1::FromTokio<std::io::Cursor<Vec<u8>>>>,
+        >,
+        512,
+    > {
+        BufStream::new(CountingBlockDevice {
+            inner: TestBlockDevice(embedded_io_adapters::tokio_1::FromTokio::new(
+                std::io::Cursor::new(data),
+            )),
+            reads: Vec::new(),
+        })
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + i / 512) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn misaligned_read_uses_one_multi_block_read() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let data = pattern(8 * 512);
+        let mut block = counting_stream(data.clone());
+
+        // Bytes 100..3784: a 412-byte head in block 0, whole blocks 1..=6, and a 200-byte
+        // tail in block 7.
+        let mut buf: Aligned<A4, [u8; 3684]> = Aligned([0; 3684]);
+        block.seek(SeekFrom::Start(100)).await.unwrap();
+        block.read_exact(&mut buf[..]).await.unwrap();
+        assert_eq!(&buf[..], &data[100..3784]);
+        // Head block into the cache, one 6-block direct read, tail block into the cache.
+        assert_eq!(block.inner.reads, [1, 6, 1]);
+        assert_eq!(block.current_offset, 3784);
+    }
+
+    #[tokio::test]
+    async fn sequential_misaligned_reads_reuse_cached_tail() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let data = pattern(32 * 512);
+        let mut block = counting_stream(data.clone());
+
+        block.seek(SeekFrom::Start(300)).await.unwrap();
+        let mut pos = 300;
+        for _ in 0..3 {
+            let mut buf: Aligned<A4, [u8; 4096]> = Aligned([0; 4096]);
+            block.read_exact(&mut buf[..]).await.unwrap();
+            assert_eq!(&buf[..], &data[pos..pos + 4096]);
+            pos += 4096;
+        }
+        // First read: head block, 7 whole blocks, tail block. Later reads start in the cached
+        // tail, so they only need the 7 whole blocks and a new tail.
+        assert_eq!(block.inner.reads, [1, 7, 1, 7, 1, 7, 1]);
+    }
+
+    #[tokio::test]
+    async fn short_misaligned_read_within_block() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let data = pattern(4 * 512);
+        let mut block = counting_stream(data.clone());
+
+        let mut buf = [0u8; 10];
+        block.seek(SeekFrom::Start(510)).await.unwrap();
+        block.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..], &data[510..520]);
+        assert_eq!(block.inner.reads, [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn direct_read_sees_dirty_cached_block() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let data = pattern(4 * 512);
+        let mut block = counting_stream(data);
+
+        // Dirty block 1 in the cache without completing it, so it isn't flushed yet
+        block.seek(SeekFrom::Start(512 + 10)).await.unwrap();
+        block.write_all(b"hello").await.unwrap();
+        assert!(block.dirty);
+
+        let mut buf: Aligned<A4, [u8; 1024]> = Aligned([0; 1024]);
+        block.seek(SeekFrom::Start(512)).await.unwrap();
+        block.read_exact(&mut buf[..]).await.unwrap();
+        assert_eq!(&buf[10..15], b"hello");
     }
 
     #[tokio::test]
