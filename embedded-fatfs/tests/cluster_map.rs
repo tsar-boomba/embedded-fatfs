@@ -287,3 +287,23 @@ async fn truncate_and_rewrite_after_mapping() {
         "after truncating to 0"
     );
 }
+
+#[tokio::test]
+async fn fat_reads_are_cached() {
+    // Every cluster is its own run and there are more runs than the map holds, so reading follows
+    // the FAT for each cluster. The FAT entries are adjacent, so a cached FAT block serves many of
+    // them: there should be about one disk read per cluster (its data), not two.
+    let cluster = 512;
+    let clusters = 1000;
+    let data = pattern(clusters * cluster, 11);
+    let (fs, reads) = make_fs(FatType::Fat32, cluster as u32, &data, 1).await;
+    let root = fs.root_dir();
+    let mut file = root.open_file("song").await.unwrap();
+    let before = reads.get();
+    assert!(read_all(&mut file, cluster).await == data);
+    let disk_reads = reads.get() - before;
+    assert!(
+        disk_reads < clusters + clusters / 10,
+        "{disk_reads} disk reads for {clusters} clusters"
+    );
+}

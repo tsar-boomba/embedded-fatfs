@@ -331,6 +331,7 @@ pub struct FileSystem<IO: Read + Write + Seek, TP, OCC> {
     total_clusters: u32,
     fs_info: RefCell<FsInfoSector>,
     current_status_flags: Cell<FsStatusFlags>,
+    fat_cache: RefCell<FatCache>,
 }
 
 /// The underlying storage device
@@ -422,6 +423,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
             total_clusters,
             fs_info: RefCell::new(fs_info),
             current_status_flags: Cell::new(status_flags),
+            fat_cache: RefCell::new(FatCache::new()),
         })
     }
 
@@ -474,7 +476,7 @@ impl<IO: ReadWriteSeek, TP, OCC> FileSystem<IO, TP, OCC> {
     }
 
     fn fat_slice(&self) -> impl ReadWriteSeek<Error = Error<IO::Error>> + '_ {
-        let io = FsIoAdapter { fs: self };
+        let io = FatIoAdapter { fs: self, pos: 0 };
         fat_slice(io, &self.bpb)
     }
 
@@ -747,6 +749,133 @@ impl<IO: ReadWriteSeek, TP, OCC> Seek for FsIoAdapter<'_, IO, TP, OCC> {
 impl<IO: ReadWriteSeek, TP, OCC> Clone for FsIoAdapter<'_, IO, TP, OCC> {
     fn clone(&self) -> Self {
         FsIoAdapter { fs: self.fs }
+    }
+}
+
+/// Size of the block of the FAT kept in [`FatCache`].
+const FAT_CACHE_SIZE: usize = 512;
+
+/// A copy of one block of the FAT (by its byte offset on the disk), so following a cluster chain
+/// doesn't read the disk for every entry.
+///
+/// FAT accesses go through the storage's own buffering otherwise, which typically holds a single
+/// block that file data reads use too. Reading a file's next cluster from the FAT then evicts the
+/// file's data, and the next data read evicts the FAT block again, so with small clusters nearly
+/// every cluster costs a FAT read. A FAT block holds 128 (FAT32) to 256 (FAT16) entries.
+///
+/// Every FAT access goes through [`FatIoAdapter`], which writes through this cache, so it never
+/// goes stale.
+#[repr(C, align(32))]
+struct FatCache {
+    /// Aligned so storage that reads whole blocks straight into the caller's buffer can do so.
+    data: [u8; FAT_CACHE_SIZE],
+    /// Disk offset of `data`, if it holds anything.
+    offset: Option<u64>,
+}
+
+impl FatCache {
+    const fn new() -> Self {
+        Self {
+            data: [0; FAT_CACHE_SIZE],
+            offset: None,
+        }
+    }
+}
+
+/// Reads and writes the FAT through the [`FatCache`]. Writes go to the disk right away and update
+/// the cached copy.
+pub(crate) struct FatIoAdapter<'a, IO: ReadWriteSeek, TP, OCC> {
+    fs: &'a FileSystem<IO, TP, OCC>,
+    /// Position on the disk
+    pos: u64,
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> IoBase for FatIoAdapter<'_, IO, TP, OCC> {
+    type Error = IO::Error;
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> Read for FatIoAdapter<'_, IO, TP, OCC> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let block = self.pos - self.pos % FAT_CACHE_SIZE as u64;
+        let in_block = (self.pos - block) as usize;
+        let len = cmp::min(buf.len(), FAT_CACHE_SIZE - in_block);
+
+        let mut cache = self.fs.fat_cache.borrow_mut();
+        if cache.offset != Some(block) {
+            cache.offset = None;
+            let mut disk = self.fs.disk.borrow_mut();
+            disk.seek(SeekFrom::Start(block)).await?;
+            let mut filled = 0;
+            while filled < FAT_CACHE_SIZE {
+                match disk.read(&mut cache.data[filled..]).await? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            if filled < FAT_CACHE_SIZE {
+                // The disk ended inside the block, which shouldn't happen for a FAT. Read
+                // without the cache.
+                drop(cache);
+                disk.seek(SeekFrom::Start(self.pos)).await?;
+                let n = disk.read(&mut buf[..len]).await?;
+                self.pos += n as u64;
+                return Ok(n);
+            }
+            cache.offset = Some(block);
+        }
+
+        buf[..len].copy_from_slice(&cache.data[in_block..in_block + len]);
+        self.pos += len as u64;
+        Ok(len)
+    }
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> Write for FatIoAdapter<'_, IO, TP, OCC> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        let size = {
+            let mut disk = self.fs.disk.borrow_mut();
+            disk.seek(SeekFrom::Start(self.pos)).await?;
+            disk.write(buf).await?
+        };
+
+        // Update the cached copy of what was written
+        let mut cache = self.fs.fat_cache.borrow_mut();
+        if let Some(block) = cache.offset {
+            let start = cmp::max(self.pos, block);
+            let end = cmp::min(self.pos + size as u64, block + FAT_CACHE_SIZE as u64);
+            if start < end {
+                let src = (start - self.pos) as usize..(end - self.pos) as usize;
+                let dst = (start - block) as usize..(end - block) as usize;
+                cache.data[dst].copy_from_slice(&buf[src]);
+            }
+        }
+        drop(cache);
+
+        self.pos += size as u64;
+        if size > 0 {
+            self.fs.set_dirty_flag(true).await?;
+        }
+        Ok(size)
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.fs.disk.borrow_mut().flush().await
+    }
+}
+
+impl<IO: ReadWriteSeek, TP, OCC> Seek for FatIoAdapter<'_, IO, TP, OCC> {
+    async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+        self.pos = match pos {
+            SeekFrom::Start(pos) => pos,
+            // Only `DiskSlice` uses this adapter, and it always seeks from the start. Anything else
+            // is resolved by the disk.
+            pos => {
+                let mut disk = self.fs.disk.borrow_mut();
+                disk.seek(SeekFrom::Start(self.pos)).await?;
+                disk.seek(pos).await?
+            }
+        };
+        Ok(self.pos)
     }
 }
 
