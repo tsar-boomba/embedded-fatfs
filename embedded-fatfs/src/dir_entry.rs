@@ -629,7 +629,12 @@ impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
         self.data.is_file()
     }
 
-    pub(crate) fn first_cluster(&self) -> Option<u32> {
+    /// Returns the first cluster of the entry's data, or `None` for an empty file.
+    ///
+    /// It's unique among live files and survives renames and moves, so together with the size and
+    /// modification time it identifies a file's contents without reading them.
+    #[must_use]
+    pub fn first_cluster(&self) -> Option<u32> {
         self.data.first_cluster(self.fs.fat_type())
     }
 
